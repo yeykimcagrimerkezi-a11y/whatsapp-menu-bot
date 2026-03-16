@@ -21,7 +21,7 @@ app.get("/", (req, res) => {
 // Burayı tarayıcıda açınca direkt senin numarana menü göndermeyi dener
 app.get("/test-menu", async (req, res) => {
   try {
-    const to = "905XXXXXXXXX"; // KENDI NUMARANI YAZ. Örnek: 905356390796
+    const to = "905356390796"; // KENDI NUMARANI YAZ. Örnek: 905356390796
     await sendMainMenu(to);
     res.send("Menü gönderildi.");
   } catch (error) {
