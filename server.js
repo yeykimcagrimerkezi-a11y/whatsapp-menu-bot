@@ -16,23 +16,21 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const STORE_URL = "https://magaza.yeykim.com.tr/magaza/";
 const BASE_URL = "https://magaza.yeykim.com.tr";
 
-// Bellekte kısa süreli ürün önbelleği
-let productCache = {
+let storeCache = {
   items: [],
   fetchedAt: 0
 };
 
 const CACHE_MS = 5 * 60 * 1000;
 
-// Ana sayfa
 app.get("/", (req, res) => {
   res.send("WhatsApp fiyat botu çalışıyor.");
 });
 
-// Test için: kendi numarana ana menü yollar
+// Kendi numarana menü test etmek için
 app.get("/test-menu", async (req, res) => {
   try {
-    const to = "905531154341"; // KENDI NUMARANI BURAYA YAZ
+    const to = "905531154341"; // kendi numaran
     await sendMainMenu(to);
     res.send("Menü gönderildi.");
   } catch (error) {
@@ -41,14 +39,30 @@ app.get("/test-menu", async (req, res) => {
   }
 });
 
-// Test için: mağazadan ürün çekmeyi kontrol et
+// Ürünleri görmek için test endpoint
 app.get("/test-products", async (req, res) => {
   try {
-    const products = await getProducts();
+    const products = await getStoreProducts();
     res.json(products);
   } catch (error) {
     console.error("TEST PRODUCTS HATASI:", error.response?.data || error.message);
     res.status(500).json({ error: "Ürünler çekilemedi." });
+  }
+});
+
+// Tek ürün detayını görmek için test endpoint
+app.get("/test-product-detail", async (req, res) => {
+  try {
+    const { slug } = req.query;
+    if (!slug) {
+      return res.status(400).json({ error: "slug gerekli" });
+    }
+
+    const detail = await getProductDetailBySlug(slug);
+    res.json(detail);
+  } catch (error) {
+    console.error("TEST PRODUCT DETAIL HATASI:", error.response?.data || error.message);
+    res.status(500).json({ error: "Ürün detayı çekilemedi." });
   }
 });
 
@@ -84,11 +98,13 @@ app.post("/webhook", async (req, res) => {
     console.log("MESAJ TYPE:", message.type);
     console.log("FROM:", from);
 
+    // Kullanıcı düz metin yazarsa ana menü
     if (message.type === "text") {
       await sendMainMenu(from);
       return res.sendStatus(200);
     }
 
+    // Buton veya liste seçimi
     if (message.type === "interactive") {
       const buttonReply = message.interactive?.button_reply;
       const listReply = message.interactive?.list_reply;
@@ -97,7 +113,7 @@ app.post("/webhook", async (req, res) => {
       console.log("INTERACTIVE SECIM:", selectedId);
 
       if (selectedId === "BTN_PRICE") {
-        await sendProductList(from);
+        await sendCategoryMenu(from);
       } else if (selectedId === "BTN_PRODUCTS") {
         await sendCategorySummary(from);
       } else if (selectedId === "BTN_SUPPORT") {
@@ -105,9 +121,12 @@ app.post("/webhook", async (req, res) => {
           from,
           "Destek talebinizi kısa şekilde yazın, size dönüş yapalım."
         );
-      } else if (selectedId?.startsWith("PROD_")) {
-        const slug = selectedId.replace("PROD_", "");
-        await sendProductDetail(from, slug);
+      } else if (selectedId.startsWith("CAT_")) {
+        const categorySlug = selectedId.replace("CAT_", "");
+        await sendProductsByCategory(from, categorySlug);
+      } else if (selectedId.startsWith("PROD_")) {
+        const productSlug = selectedId.replace("PROD_", "");
+        await sendSelectedProductDetail(from, productSlug);
       } else if (selectedId === "BTN_BACK_MAIN") {
         await sendMainMenu(from);
       } else {
@@ -164,45 +183,33 @@ async function sendMainMenu(to) {
         }
       }
     },
-    {
-      headers: {
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
-        "Content-Type": "application/json"
-      }
-    }
+    authHeaders()
   );
 }
 
 // Kategori özeti
 async function sendCategorySummary(to) {
-  const products = await getProducts();
+  const products = await getStoreProducts();
 
-  const categories = [...new Set(products.map((p) => p.category).filter(Boolean))];
+  const categories = getUniqueCategories(products);
 
   const text =
     "Mağazada bulunan kategoriler:\n\n" +
-    categories.map((c) => `• ${c}`).join("\n") +
-    "\n\nFiyat görmek için 'Fiyat Al' seçeneğini kullanabilirsiniz.";
+    categories.map((c) => `• ${c.name}`).join("\n") +
+    "\n\nFiyat almak için 'Fiyat Al' seçeneğini kullanabilirsiniz.";
 
   await sendText(to, text);
 }
 
-// Ürün listesini list message ile gönder
-async function sendProductList(to) {
-  const products = await getProducts();
+// Kategori menüsü
+async function sendCategoryMenu(to) {
+  const products = await getStoreProducts();
+  const categories = getUniqueCategories(products);
 
-  if (!products.length) {
-    await sendText(to, "Şu anda ürün listesi alınamadı. Lütfen biraz sonra tekrar deneyin.");
-    return;
-  }
-
-  // WhatsApp list message sınırları için ilk 10 ürünü gösterelim
-  const visibleProducts = products.slice(0, 10);
-
-  const rows = visibleProducts.map((product) => ({
-    id: `PROD_${product.slug}`,
-    title: truncate(product.name, 24),
-    description: truncate(`${product.category} | ${product.priceText}`, 72)
+  const rows = categories.slice(0, 10).map((category) => ({
+    id: `CAT_${category.slug}`,
+    title: truncate(category.name, 24),
+    description: `${category.count} ürün`
   }));
 
   await axios.post(
@@ -214,68 +221,114 @@ async function sendProductList(to) {
       interactive: {
         type: "list",
         body: {
-          text: "Lütfen fiyatını görmek istediğiniz ürünü seçin."
+          text: "Lütfen kategori seçin."
         },
         action: {
-          button: "Ürünleri Gör",
+          button: "Kategorileri Gör",
           sections: [
             {
-              title: "Ürün Listesi",
+              title: "Kategoriler",
               rows
             }
           ]
         }
       }
     },
+    authHeaders()
+  );
+}
+
+// Kategoriye göre sadece ürün isimlerini göster
+async function sendProductsByCategory(to, categorySlug) {
+  const products = await getStoreProducts();
+
+  const filtered = products.filter((p) => p.categorySlug === categorySlug);
+
+  if (!filtered.length) {
+    await sendText(to, "Bu kategoride ürün bulunamadı.");
+    return;
+  }
+
+  const categoryName = filtered[0].category || "Kategori";
+
+  const rows = filtered.slice(0, 10).map((product) => ({
+    id: `PROD_${product.slug}`,
+    title: truncate(cleanProductName(product.name), 24),
+    description: "Ürün detayını görmek için seçin"
+  }));
+
+  await axios.post(
+    `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/messages`,
     {
-      headers: {
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
-        "Content-Type": "application/json"
+      messaging_product: "whatsapp",
+      to,
+      type: "interactive",
+      interactive: {
+        type: "list",
+        body: {
+          text: `${categoryName} kategorisindeki ürünlerden birini seçin.`
+        },
+        action: {
+          button: "Ürünleri Gör",
+          sections: [
+            {
+              title: truncate(categoryName, 24),
+              rows
+            }
+          ]
+        }
       }
-    }
+    },
+    authHeaders()
   );
 
-  if (products.length > 10) {
+  if (filtered.length > 10) {
     await sendText(
       to,
-      `Toplam ${products.length} ürün bulundu. Şu anda ilk 10 ürünü gösteriyorum.`
+      `Bu kategoride toplam ${filtered.length} ürün var. Şu anda ilk 10 ürün gösterildi.`
     );
   }
 }
 
-// Seçilen ürünün detayını gönder
-async function sendProductDetail(to, slug) {
-  const products = await getProducts();
-  const product = products.find((p) => p.slug === slug);
+// Ürün seçildikten sonra detay sayfasını okuyup cevap ver
+async function sendSelectedProductDetail(to, productSlug) {
+  const detail = await getProductDetailBySlug(productSlug);
 
-  if (!product) {
-    await sendText(to, "Ürün bulunamadı. Lütfen tekrar deneyin.");
+  if (!detail) {
+    await sendText(to, "Ürün detayı alınamadı. Lütfen tekrar deneyin.");
     return;
   }
 
-  let message =
-    `*${product.name}*\n\n` +
-    `Kategori: ${product.category || "-"}\n` +
-    `Fiyat: ${product.priceText || "-"}`;
+  let text =
+    `*${cleanProductName(detail.name)}*\n\n` +
+    `Kategori: ${detail.category || "-"}\n`;
 
-  if (product.hasVariants) {
-    message += `\nNot: Bu ürünün birden fazla varyasyonu olabilir.`;
+  if (detail.priceText) {
+    text += `Fiyat: ${detail.priceText}\n`;
   }
 
-  if (product.url) {
-    message += `\nLink: ${product.url}`;
+  if (detail.shortDescription) {
+    text += `\n${detail.shortDescription}\n`;
   }
 
-  await sendText(to, message);
+  if (detail.variationSummary) {
+    text += `\n*Seçenekler / KG / Varyasyonlar*\n${detail.variationSummary}\n`;
+  }
 
-  // Geri dönmek için kısa yönlendirme
-  await sendText(
-    to,
-    "Başka bir ürün görmek için tekrar mesaj yazabilir veya menüden devam edebilirsiniz."
-  );
+  if (detail.url) {
+    text += `\nÜrün linki: ${detail.url}`;
+  }
+
+  await sendText(to, text);
+
+  if (detail.hasVariants) {
+    await sendText(
+      to,
+      "Bu ürün varyasyonlu görünüyor. İsterseniz istediğiniz kg veya seçeneği yazın, buna göre daha net yönlendirme yapayım."
+    );
+  }
 }
 
-// Normal text mesajı
 async function sendText(to, text) {
   await axios.post(
     `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/messages`,
@@ -287,24 +340,28 @@ async function sendText(to, text) {
         body: text
       }
     },
-    {
-      headers: {
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
-        "Content-Type": "application/json"
-      }
-    }
+    authHeaders()
   );
 }
 
-// Ürünleri mağaza sayfasından çek
-async function getProducts() {
+function authHeaders() {
+  return {
+    headers: {
+      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      "Content-Type": "application/json"
+    }
+  };
+}
+
+// Mağaza ürünlerini liste sayfasından çek
+async function getStoreProducts() {
   const now = Date.now();
 
   if (
-    productCache.items.length > 0 &&
-    now - productCache.fetchedAt < CACHE_MS
+    storeCache.items.length > 0 &&
+    now - storeCache.fetchedAt < CACHE_MS
   ) {
-    return productCache.items;
+    return storeCache.items;
   }
 
   const response = await axios.get(STORE_URL, {
@@ -317,37 +374,26 @@ async function getProducts() {
   const $ = cheerio.load(response.data);
   const products = [];
 
-  // WooCommerce ürün kartlarını hedefle
   $("li.product, .products .product, ul.products > li").each((_, el) => {
     const card = $(el);
 
-    let name =
-      card.find("h2, .woocommerce-loop-product__title").first().text().trim() ||
+    const category =
+      card.find(".product-cat, .posted_in a").first().text().trim() ||
+      extractCategoryFromCardText(card.text());
+
+    const name =
+      card.find(".woocommerce-loop-product__title, h2").first().text().trim() ||
       card.find("a[href*='/product/']").first().text().trim();
 
-    const productLinkEl =
+    const link =
       card.find("a.woocommerce-LoopProduct-link").first().attr("href") ||
       card.find("a[href*='/product/']").first().attr("href") ||
-      card.find("a").first().attr("href");
-
-    const url = normalizeUrl(productLinkEl);
-
-    let category =
-      card.find(".posted_in a").first().text().trim() ||
-      card
-        .contents()
-        .filter((_, node) => node.type === "text")
-        .text()
-        .trim();
-
-    if (!category) {
-      const rawText = card.text().replace(/\s+/g, " ").trim();
-      category = inferCategory(rawText);
-    }
-
-    let priceText =
-      card.find(".price").first().text().replace(/\s+/g, " ").trim() ||
       "";
+
+    if (!name || !link) return;
+
+    const url = normalizeUrl(link);
+    const slug = extractProductSlug(url);
 
     const rawText = card.text().replace(/\s+/g, " ").trim();
 
@@ -355,31 +401,152 @@ async function getProducts() {
       /birden fazla varyasyonu var/i.test(rawText) ||
       /Seçenekler/i.test(rawText);
 
-    // Bazı kartlarda isim boş gelirse atla
-    if (!name) return;
-
-    // Fiyat yoksa da ürünü al ama boş bırak
-    const slug = makeSlug(name);
-
     products.push({
       slug,
       name,
+      cleanName: cleanProductName(name),
       category,
-      priceText: cleanPriceText(priceText),
+      categorySlug: makeSlug(category),
       hasVariants,
       url
     });
   });
 
-  // Tekilleştir
-  const uniqueProducts = dedupeBySlug(products).filter((p) => p.name);
+  const unique = dedupeBySlug(products);
 
-  productCache = {
-    items: uniqueProducts,
+  storeCache = {
+    items: unique,
     fetchedAt: now
   };
 
-  return uniqueProducts;
+  return unique;
+}
+
+// Ürün detay sayfasını oku
+async function getProductDetailBySlug(slug) {
+  const products = await getStoreProducts();
+  const product = products.find((p) => p.slug === slug);
+
+  if (!product?.url) return null;
+
+  const response = await axios.get(product.url, {
+    timeout: 20000,
+    headers: {
+      "User-Agent": "Mozilla/5.0"
+    }
+  });
+
+  const $ = cheerio.load(response.data);
+
+  const name =
+    $(".product_title").first().text().trim() ||
+    $("h1").first().text().trim() ||
+    product.name;
+
+  const category =
+    $(".posted_in a").first().text().trim() ||
+    product.category ||
+    "";
+
+  const priceText = $(".price").first().text().replace(/\s+/g, " ").trim();
+
+  const shortDescription =
+    $(".woocommerce-product-details__short-description").first().text().replace(/\s+/g, " ").trim() ||
+    $(".product-short-description").first().text().replace(/\s+/g, " ").trim() ||
+    "";
+
+  // select / option bazlı varyasyonları yakala
+  const variationOptions = [];
+  $("form.variations_form select option").each((_, el) => {
+    const value = $(el).attr("value") || "";
+    const label = $(el).text().replace(/\s+/g, " ").trim();
+
+    if (!label) return;
+    if (label.toLowerCase().includes("bir seçenek seçin")) return;
+    if (!value) return;
+
+    variationOptions.push(label);
+  });
+
+  // buton / radio benzeri seçenekleri de yakala
+  $(".variable-items-wrapper .variable-item, .variations .label, .variations td.value").each((_, el) => {
+    const txt = $(el).text().replace(/\s+/g, " ").trim();
+    if (!txt) return;
+    if (txt.length < 2) return;
+    variationOptions.push(txt);
+  });
+
+  const cleanedVariationOptions = uniqueCleanList(
+    variationOptions
+      .map((v) => v.replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+  );
+
+  const variationSummary = cleanedVariationOptions.length
+    ? cleanedVariationOptions.map((v) => `• ${v}`).join("\n")
+    : "";
+
+  const hasVariants = product.hasVariants || cleanedVariationOptions.length > 0;
+
+  return {
+    slug,
+    name,
+    category,
+    priceText: cleanPriceText(priceText),
+    shortDescription: truncateText(shortDescription, 500),
+    variationSummary,
+    hasVariants,
+    url: product.url
+  };
+}
+
+function getUniqueCategories(products) {
+  const map = new Map();
+
+  for (const product of products) {
+    const slug = product.categorySlug || "diger";
+    const name = product.category || "Diğer";
+
+    if (!map.has(slug)) {
+      map.set(slug, {
+        slug,
+        name,
+        count: 1
+      });
+    } else {
+      map.get(slug).count += 1;
+    }
+  }
+
+  return [...map.values()];
+}
+
+function extractCategoryFromCardText(text) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+
+  const knownCategories = [
+    "Boyalar Zemin Sistemleri",
+    "Su Yalıtım Ürünleri",
+    "Yapı Kimyasalları",
+    "Yardımcı Ürünler ve Astarlar"
+  ];
+
+  for (const category of knownCategories) {
+    if (normalized.includes(category)) return category;
+  }
+
+  return "";
+}
+
+function cleanProductName(name) {
+  return name
+    .replace(/^Quattro\s+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanPriceText(priceText) {
+  return priceText.replace(/\s+/g, " ").trim();
 }
 
 function normalizeUrl(url) {
@@ -389,23 +556,10 @@ function normalizeUrl(url) {
   return `${BASE_URL}/${url}`;
 }
 
-function inferCategory(text) {
-  const categories = [
-    "Boyalar Zemin Sistemleri",
-    "Su Yalıtım Ürünleri",
-    "Yapı Kimyasalları",
-    "Yardımcı Ürünler ve Astarlar"
-  ];
-
-  for (const category of categories) {
-    if (text.includes(category)) return category;
-  }
-
-  return "";
-}
-
-function cleanPriceText(priceText) {
-  return priceText.replace(/\s+/g, " ").trim();
+function extractProductSlug(url) {
+  const clean = url.split("?")[0].replace(/\/+$/, "");
+  const parts = clean.split("/");
+  return parts[parts.length - 1];
 }
 
 function makeSlug(text) {
@@ -432,9 +586,18 @@ function dedupeBySlug(items) {
   return [...map.values()];
 }
 
+function uniqueCleanList(items) {
+  return [...new Set(items)];
+}
+
 function truncate(text, maxLen) {
   if (!text) return "";
   return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
+}
+
+function truncateText(text, maxLen) {
+  if (!text) return "";
+  return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
 }
 
 app.listen(PORT, () => {
